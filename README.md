@@ -1,8 +1,31 @@
 # AI Usage Menubar
 
+<p align="center">
+  <img src="docs/images/ai-usage-menubar-hero.png" alt="CodexとClaude Codeの利用率を表示するmacOSメニューバーアプリの画面イメージ" width="100%">
+</p>
+
+<p align="center">
+  <img alt="macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-111827?logo=apple&logoColor=white">
+  <img alt="Objective-C" src="https://img.shields.io/badge/Objective--C-AppKit-2563EB?logo=apple&logoColor=white">
+  <img alt="No API key required" src="https://img.shields.io/badge/API_key-not_required-16A34A">
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-7C3AED"></a>
+</p>
+
 CodexとClaude Codeの利用率を、macOSのメニューバーでいつでも確認できる軽量なネイティブアプリです。
 
 `Codex 61%` / `Claude 32%` のように常時表示し、使用率に応じて緑・オレンジ・赤へ変化します。ライト／ダークモードと複数ディスプレイに対応しています。
+
+> 上の画像は実装をもとにした画面イメージです。表示される使用率・期間・モデル名はアカウントと利用状況によって変わります。
+
+## ひと目で分かること
+
+| | Codex | Claude Code |
+|---|---|---|
+| メニューバー | `Codex 61%` | `Claude 32%` |
+| 利用枠 | サブスクリプション枠 | セッション枠・週間枠 |
+| 詳細 | リセット時刻、累計トークン、文脈使用率 | リセット時刻、使用モデル |
+| データ取得 | ローカルの`token_count`イベント | Claude Codeの`statusLine` |
+| 追加API通信 | なし | なし |
 
 ## 特長
 
@@ -19,6 +42,18 @@ CodexとClaude Codeの利用率を、macOSのメニューバーでいつでも�
 - Xcode Command Line Tools（`xcode-select --install`）
 - Codexデスクトップ／Codex CLI
 - Claude版を使う場合はClaude Code
+
+## クイックスタート
+
+リポジトリを取得し、両方のアプリをビルドします。
+
+```sh
+git clone https://github.com/akh1r0ck/ai-usage-menubar.git
+cd ai-usage-menubar
+make build
+```
+
+ビルド結果は `dist/ChatGPT Usage.app` と `dist/Claude Usage.app` に作成されます。
 
 ## Codex版
 
@@ -41,6 +76,29 @@ open "dist/Claude Usage.app"
 
 設定後、Claude Codeを再起動して1メッセージ送信すると利用率が表示されます。
 
+## 仕組み
+
+```mermaid
+flowchart LR
+    Codex["Codex Desktop / CLI"] -->|"token_count"| CodexLog["~/.codex/sessions"]
+    CodexLog --> CodexApp["Codex Usage Menubar"]
+    Claude["Claude Code"] -->|"statusLine JSON"| Capture["ローカル中継スクリプト"]
+    Capture --> ClaudeCache["~/.claude/usage-menubar.json"]
+    ClaudeCache --> ClaudeApp["Claude Usage Menubar"]
+    CodexApp --> MenuBar["macOS メニューバー"]
+    ClaudeApp --> MenuBar
+```
+
+どちらも読み取りと表示はMac内で完結します。利用量を確認するための追加APIリクエストは発生しません。
+
+## 色の見方
+
+| 使用率 | 色 | 状態 |
+|---:|:---:|---|
+| 0–59% | 🟢 | 余裕あり |
+| 60–84% | 🟠 | 残量に注意 |
+| 85–100% | 🔴 | 上限が近い |
+
 ## 複数ディスプレイ
 
 「システム設定」→「デスクトップとDock」→「Mission Control」→「ディスプレイごとに個別の操作スペース」をオンにし、一度ログアウトしてください。各画面のメニューバーに使用率が表示されます。
@@ -57,6 +115,18 @@ make check
 ```
 
 アプリはObjective-CとAppKitで実装しており、外部ライブラリには依存していません。生成された `.app` は `dist/` に置かれ、Gitには含まれません。
+
+### プロジェクト構成
+
+```text
+.
+├── Sources/       # Codex版・Claude版のAppKit実装
+├── Resources/     # 各アプリのInfo.plist
+├── scripts/       # ビルドとClaude statusLine設定
+├── docs/images/   # README用画像
+├── Makefile
+└── README.md
+```
 
 ## プライバシー
 
