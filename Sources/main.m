@@ -1,40 +1,10 @@
 #import <Cocoa/Cocoa.h>
+#import <UserNotifications/UserNotifications.h>
+#import "UsageUI.h"
+#import "UsageProvider.h"
 
-static NSColor *UsageColor(double value) {
-    if (value < 60) return NSColor.systemGreenColor;
-    if (value < 85) return NSColor.systemOrangeColor;
-    return NSColor.systemRedColor;
-}
-
-static NSFont *ModernFont(CGFloat size, NSFontWeight weight) {
-    NSFont *base = [NSFont systemFontOfSize:size weight:weight];
-    NSFontDescriptor *descriptor = [base.fontDescriptor fontDescriptorWithDesign:NSFontDescriptorSystemDesignRounded];
-    return descriptor ? [NSFont fontWithDescriptor:descriptor size:size] : base;
-}
-
-static NSAttributedString *CodexTitle(NSString *value, NSColor *color) {
-    NSMutableAttributedString *text = [[NSMutableAttributedString alloc] initWithString:@"Codex " attributes:@{NSFontAttributeName: ModernFont(13, NSFontWeightSemibold), NSForegroundColorAttributeName: NSColor.systemBlueColor}];
-    [text appendAttributedString:[[NSAttributedString alloc] initWithString:value attributes:@{NSFontAttributeName: ModernFont(13, NSFontWeightBold), NSForegroundColorAttributeName: color}]];
-    return text;
-}
-
-@interface UsageBar : NSView
-@property (nonatomic) double value;
-@end
-
-@implementation UsageBar
-- (void)setValue:(double)value { _value = value; self.needsDisplay = YES; }
-- (void)drawRect:(NSRect)dirtyRect {
-    NSRect box = NSInsetRect(self.bounds, 1, 4);
-    NSBezierPath *background = [NSBezierPath bezierPathWithRoundedRect:box xRadius:5 yRadius:5];
-    [NSColor.quaternaryLabelColor setFill]; [background fill];
-    double fraction = MAX(0, MIN(1, self.value / 100.0));
-    if (fraction <= 0) return;
-    box.size.width *= fraction;
-    NSBezierPath *fill = [NSBezierPath bezierPathWithRoundedRect:box xRadius:5 yRadius:5];
-    [UsageColor(self.value) setFill]; [fill fill];
-}
-@end
+#define ModernFont UsageDetailFont
+static NSAttributedString *CodexTitle(NSString *value, NSColor *color) { return UsageStatusTitle(UsageServiceCodex, value, color); }
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property NSStatusItem *statusItem;
@@ -47,11 +17,18 @@ static NSAttributedString *CodexTitle(NSString *value, NSColor *color) {
 @property NSTextField *updatedLabel;
 @property UsageBar *bar;
 @property NSTimer *timer;
+@property UsageSettingsWindowController *settingsWindow;
+@property UsageNotificationController *notificationController;
+@property id<UsageProvider> provider;
 @end
 
 @implementation AppDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    UsageApplyTheme();
+    self.notificationController=[[UsageNotificationController alloc]initWithService:UsageServiceCodex];
+    UNUserNotificationCenter.currentNotificationCenter.delegate=(id)self.notificationController;
+    self.provider=[CodexUsageProvider new];
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     self.statusItem.button.attributedTitle = CodexTitle(@"--%", NSColor.secondaryLabelColor);
     self.statusItem.button.toolTip = @"ChatGPT / Codex 使用量";
@@ -60,7 +37,9 @@ static NSAttributedString *CodexTitle(NSString *value, NSColor *color) {
     [self buildPopover];
     [self refresh];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(screensChanged:) name:NSApplicationDidChangeScreenParametersNotification object:nil];
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:5 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(settingsChanged:) name:UsageSettingsDidChangeNotification object:nil];
+    [NSDistributedNotificationCenter.defaultCenter addObserver:self selector:@selector(settingsChanged:) name:UsageSettingsDidChangeNotification object:nil];
+    [self restartTimer];
 }
 
 - (void)screensChanged:(NSNotification *)notification {
@@ -94,12 +73,15 @@ static NSAttributedString *CodexTitle(NSString *value, NSColor *color) {
     self.tokenLabel = [self label:@"" size:12 color:nil];
     self.contextLabel = [self label:@"" size:12 color:nil];
     self.updatedLabel = [self label:@"" size:10 color:NSColor.tertiaryLabelColor];
+    UsageSettingsStore *display=UsageSettingsStore.sharedStore;
+    self.resetLabel.hidden=!display.showResetTime;self.tokenLabel.hidden=!display.showTokenUsage;self.contextLabel.hidden=!display.showContextUsage;self.updatedLabel.hidden=!display.showUpdatedTime;
     self.bar = [UsageBar new]; self.bar.translatesAutoresizingMaskIntoConstraints = NO;
     [self.bar.heightAnchor constraintEqualToConstant:16].active = YES;
 
+    NSButton *settings = [NSButton buttonWithTitle:@"設定…" target:self action:@selector(openSettings:)];
     NSButton *refresh = [NSButton buttonWithTitle:@"更新" target:self action:@selector(refresh)];
     NSButton *quit = [NSButton buttonWithTitle:@"終了" target:NSApp action:@selector(terminate:)];
-    NSStackView *buttons = [NSStackView stackViewWithViews:@[refresh, quit]];
+    NSStackView *buttons = [NSStackView stackViewWithViews:@[settings, refresh, quit]];
     buttons.spacing = 8; buttons.distribution = NSStackViewDistributionFillEqually;
 
     NSStackView *stack = [NSStackView stackViewWithViews:@[title, self.percentLabel, self.periodLabel, self.bar, self.resetLabel, self.tokenLabel, self.contextLabel, self.updatedLabel, buttons]];
@@ -122,69 +104,42 @@ static NSAttributedString *CodexTitle(NSString *value, NSColor *color) {
     self.popover.behavior = NSPopoverBehaviorTransient;
 }
 
+- (void)openSettings:(id)sender { if(!self.settingsWindow)self.settingsWindow=[[UsageSettingsWindowController alloc]initWithService:UsageServiceCodex];[self.settingsWindow showWindow:nil];[NSApp activateIgnoringOtherApps:YES]; }
+- (void)restartTimer { [self.timer invalidate];self.timer=nil;if(UsageSettingsStore.sharedStore.autoRefreshEnabled)self.timer=[NSTimer scheduledTimerWithTimeInterval:UsageSettingsStore.sharedStore.refreshInterval target:self selector:@selector(refresh) userInfo:nil repeats:YES]; }
+- (void)settingsChanged:(NSNotification *)notification { if([notification.object isKindOfClass:NSString.class]&&[notification.object isEqualToString:NSBundle.mainBundle.bundleIdentifier])return;UsageApplyTheme();[self restartTimer]; [self buildPopover]; [self refresh]; }
+
 - (void)togglePopover:(id)sender {
     if (self.popover.shown) [self.popover performClose:nil];
-    else { [self refresh]; [self.popover showRelativeToRect:self.statusItem.button.bounds ofView:self.statusItem.button preferredEdge:NSRectEdgeMinY]; }
-}
-
-- (NSDictionary *)latestEvent {
-    NSURL *root = [NSFileManager.defaultManager.homeDirectoryForCurrentUser URLByAppendingPathComponent:@".codex/sessions"];
-    NSArray *keys = @[NSURLContentModificationDateKey, NSURLIsRegularFileKey];
-    NSDirectoryEnumerator *enumerator = [NSFileManager.defaultManager enumeratorAtURL:root includingPropertiesForKeys:keys options:NSDirectoryEnumerationSkipsHiddenFiles errorHandler:nil];
-    NSMutableArray *files = [NSMutableArray array];
-    for (NSURL *url in enumerator) {
-        if (![url.pathExtension isEqualToString:@"jsonl"]) continue;
-        NSDate *date = nil; [url getResourceValue:&date forKey:NSURLContentModificationDateKey error:nil];
-        if (date) [files addObject:@{ @"url": url, @"date": date }];
-    }
-    [files sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [b[@"date"] compare:a[@"date"]]; }];
-    for (NSDictionary *file in [files subarrayWithRange:NSMakeRange(0, MIN(12, files.count))]) {
-        NSString *text = [NSString stringWithContentsOfURL:file[@"url"] encoding:NSUTF8StringEncoding error:nil];
-        NSArray *lines = [text componentsSeparatedByString:@"\n"];
-        for (NSString *line in lines.reverseObjectEnumerator) {
-            NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-            NSDictionary *event = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-            NSDictionary *payload = event[@"payload"];
-            if ([payload[@"type"] isEqualToString:@"token_count"]) return @{ @"payload": payload, @"date": file[@"date"] };
-        }
-    }
-    return nil;
+    else { if(UsageSettingsStore.sharedStore.refreshWhenOpened)[self refresh]; [self.popover showRelativeToRect:self.statusItem.button.bounds ofView:self.statusItem.button preferredEdge:NSRectEdgeMinY]; }
 }
 
 - (void)refresh {
-    NSDictionary *event = [self latestEvent];
-    if (!event) { self.statusItem.button.attributedTitle = CodexTitle(@"--%", NSColor.secondaryLabelColor); self.percentLabel.stringValue = @"データなし"; self.percentLabel.textColor = NSColor.secondaryLabelColor; self.periodLabel.stringValue = @"Codexでメッセージを送ると表示されます"; return; }
-    NSDictionary *payload = event[@"payload"];
-    NSDictionary *limits = payload[@"rate_limits"];
-    NSDictionary *window = limits[@"primary"] ?: limits[@"secondary"];
-    double percent = [window[@"used_percent"] doubleValue];
+    UsageSnapshot *snapshot=[self.provider currentSnapshot:nil];
+    if (!snapshot.available) { self.statusItem.button.attributedTitle = CodexTitle(@"--%", NSColor.secondaryLabelColor);self.statusItem.button.accessibilityLabel=@"Codex使用率、データなし"; self.percentLabel.stringValue = @"データなし"; self.percentLabel.textColor = NSColor.secondaryLabelColor; self.periodLabel.stringValue = @"Codexでメッセージを送ると表示されます"; return; }
+    double percent = snapshot.primaryPercent;
     self.bar.value = percent;
-    self.statusItem.button.attributedTitle = CodexTitle([NSString stringWithFormat:@"%.0f%%", percent], UsageColor(percent));
-    self.percentLabel.stringValue = [NSString stringWithFormat:@"%.0f%% 使用", percent];
+    self.statusItem.button.attributedTitle = CodexTitle(UsageMenuValue(percent), UsageColor(percent));
+    self.statusItem.button.accessibilityLabel=[NSString stringWithFormat:@"Codex使用率%.0fパーセント、残り%.0fパーセント",percent,100-percent];
+    self.percentLabel.stringValue = UsageSettingsStore.sharedStore.displayRemaining?[NSString stringWithFormat:@"%.0f%% 残り",100-percent]:[NSString stringWithFormat:@"%.0f%% 使用",percent];
     self.percentLabel.textColor = UsageColor(percent);
-    NSInteger minutes = [window[@"window_minutes"] integerValue];
-    NSString *plan = [limits[@"plan_type"] capitalizedString] ?: @"";
+    NSInteger minutes = snapshot.windowMinutes;
+    NSString *plan = snapshot.plan;
     NSString *duration = minutes % 10080 == 0 ? [NSString stringWithFormat:@"%ld週間", (long)(minutes / 10080)] : (minutes % 1440 == 0 ? [NSString stringWithFormat:@"%ld日間", (long)(minutes / 1440)] : [NSString stringWithFormat:@"%ld時間", (long)(minutes / 60)]);
     self.periodLabel.stringValue = [NSString stringWithFormat:@"%@・%@の利用枠", plan, duration];
-    NSTimeInterval reset = [window[@"resets_at"] doubleValue];
+    NSTimeInterval reset = snapshot.primaryReset;
+    [self.notificationController evaluateUsedPercent:percent resetIdentifier:[NSString stringWithFormat:@"%.0f",reset]];
     self.resetLabel.stringValue = reset ? [NSString stringWithFormat:@"リセット: %@", [self formatted:[NSDate dateWithTimeIntervalSince1970:reset]]] : @"リセット時刻: --";
-    NSDictionary *info = payload[@"info"];
-    NSDictionary *usage = info[@"total_token_usage"];
-    long long total = [usage[@"total_tokens"] longLongValue];
-    long long context = [info[@"model_context_window"] longLongValue];
-    self.tokenLabel.stringValue = [NSString stringWithFormat:@"累計トークン  %lld", total];
-    self.contextLabel.stringValue = [NSString stringWithFormat:@"現在の文脈    %.0f%%（上限 %lld）", context ? 100.0 * total / context : 0, context];
-    self.updatedLabel.stringValue = [NSString stringWithFormat:@"最終記録: %@", [self formatted:event[@"date"]]];
+    long long total = snapshot.totalTokens;
+    long long context = snapshot.contextWindow;
+    self.tokenLabel.stringValue = [NSString stringWithFormat:@"累計トークン  %@", UsageFormattedInteger(total)];
+    self.contextLabel.stringValue = [NSString stringWithFormat:@"現在の文脈    %.0f%%（上限 %@）", context ? 100.0 * total / context : 0, UsageFormattedInteger(context)];
+    self.updatedLabel.stringValue = [NSString stringWithFormat:@"最終記録: %@", [self formatted:snapshot.updatedAt]];
 }
 
-- (NSString *)formatted:(NSDate *)date {
-    static NSDateFormatter *formatter; static dispatch_once_t once;
-    dispatch_once(&once, ^{ formatter = [NSDateFormatter new]; formatter.locale = [NSLocale localeWithLocaleIdentifier:@"ja_JP"]; formatter.dateFormat = @"M月d日 H:mm"; });
-    return [formatter stringFromDate:date];
-}
+- (NSString *)formatted:(NSDate *)date { return UsageFormattedDate(date,NO); }
 @end
 
-int main(int argc, const char *argv[]) {
+int main(void) {
     @autoreleasepool { NSApplication *app = NSApplication.sharedApplication; AppDelegate *delegate = [AppDelegate new]; app.delegate = delegate; [app run]; }
     return 0;
 }
